@@ -226,6 +226,20 @@ jobs:
           [ "$fail" = 0 ] || exit 1
           echo "брендинг, адрес и ключ на месте."
 
+      # Qt 6.11 падает на `mocs_compilation_RelWithDebInfo.cpp` с
+      # `fatal error C1083: Cannot open compiler generated file: ''`: стадия
+      # собирает Qt с `-force-debug-info`, но CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+      # остаётся пустым, и cl.exe получает `/Fd` без пути. Явный ProgramDatabase
+      # возвращает PDB нормальное имя. Патч меняет prepare.py до Libraries,
+      # поэтому хэш кэша (шаг ниже) считается уже по исправленному файлу.
+      - name: Patch prepare.py for Qt PDB.
+        shell: bash
+        run: |
+          SRC="$GITHUB_WORKSPACE/TBuild/$REPO_NAME"
+          PREP="$SRC/$PREPARE_PATH"
+          python scripts/patch_prepare_qt_pdb.py "$PREP"
+          grep -n 'CMAKE_MSVC_DEBUG_INFORMATION_FORMAT' "$PREP"
+
       - name: First set up.
         shell: bash
         run: |
