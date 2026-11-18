@@ -429,8 +429,23 @@ jobs:
             echo "ВНИМАНИЕ: d3dcompiler_47.dll не найден — ANGLE может не запуститься." >&2
           fi
 
-          ( cd artifact && 7z a -mx9 KiteGrams-portable-win64.zip KiteGrams > /dev/null \
-            && 7z t KiteGrams-portable-win64.zip > /dev/null \
+          # 7-Zip на образах GitHub лежит в `C:\Program Files\7-Zip`, но в PATH
+          # он не всегда: официальный `build.bat` добавляет каталог руками.
+          SEVENZ=$(command -v 7z || true)
+          if [ -z "$SEVENZ" ]; then
+            for candidate in "/c/Program Files/7-Zip/7z.exe" "/c/Program Files (x86)/7-Zip/7z.exe"; do
+              [ -x "$candidate" ] && SEVENZ="$candidate" && break
+            done
+          fi
+          if [ -z "$SEVENZ" ]; then
+            echo "FAIL: не нашёл 7z — без него переносимый архив не собрать." >&2
+            exit 1
+          fi
+          echo "7z: $SEVENZ"
+
+          ( cd artifact \
+            && "$SEVENZ" a -mx9 KiteGrams-portable-win64.zip KiteGrams > /dev/null \
+            && "$SEVENZ" t KiteGrams-portable-win64.zip > /dev/null \
             && ls -la )
 
       - name: Collect artifacts.
