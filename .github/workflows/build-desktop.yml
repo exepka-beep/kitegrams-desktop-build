@@ -228,17 +228,25 @@ jobs:
 
       # Qt 6.11 падает на `mocs_compilation_RelWithDebInfo.cpp` с
       # `fatal error C1083: Cannot open compiler generated file: ''`: стадия
-      # собирает Qt с `-force-debug-info`, но CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
-      # остаётся пустым, и cl.exe получает `/Fd` без пути. Явный ProgramDatabase
-      # возвращает PDB нормальное имя. Патч меняет prepare.py до Libraries,
-      # поэтому хэш кэша (шаг ниже) считается уже по исправленному файлу.
-      - name: Patch prepare.py for Qt PDB.
+      # собирает Qt с `-force-debug-info`, а на этой связке (Qt 6.11.2 +
+      # MSVC 14.44 + Ninja) PDB для `qtmultimedia` не заводится. Пробовали
+      # явный ProgramDatabase — `/Fd` стал корректным, ошибка осталась:
+      # путь относительный (`qtbase\lib\...`), каталога ещё нет.
+      # Поэтому просто убираем `-force-debug-info`: Qt собирается обычным
+      # Release без /Zi и /Fd, символы Qt нам не нужны (crash reports off).
+      # Патч меняет prepare.py до Libraries, поэтому хэш кэша (шаг ниже)
+      # считается уже по исправленному файлу.
+      - name: Patch prepare.py: no Qt debug info.
         shell: bash
         run: |
           SRC="$GITHUB_WORKSPACE/TBuild/$REPO_NAME"
           PREP="$SRC/$PREPARE_PATH"
           python scripts/patch_prepare_qt_pdb.py "$PREP"
-          grep -n 'CMAKE_MSVC_DEBUG_INFORMATION_FORMAT' "$PREP"
+          if grep -q 'force-debug-info' "$PREP"; then
+            echo "FAIL: -force-debug-info остался в prepare.py" >&2
+            exit 1
+          fi
+          echo "Qt собирается без debug info."
 
       - name: First set up.
         shell: bash
