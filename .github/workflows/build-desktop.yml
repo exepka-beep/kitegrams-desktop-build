@@ -370,18 +370,40 @@ jobs:
         shell: bash
         run: df -h / || true
 
+      # ВАЖНО: `-path '*/src/wallet_engine/*'` здесь не для красоты.
+      #
+      # Стадия tdesktop_rust кладёт сгенерированный UniFFI-файл в
+      # `tdesktop_rust/out/src/wallet_engine/wallet_engine.cpp`, и
+      # `cmake/external/wallet_engine` компилирует его как обычный исходник.
+      # Это .cpp, он не попадает ни под один шаблон ниже — и прошлая версия
+      # этой чистки удаляла его через полсекунды после создания. Дальше
+      # Configure падал на «Cannot find source file», а выглядело так, будто
+      # виноват bindgen: в `out/include/wallet_engine` оставались только .hpp.
+      # Поэтому каталог исключается явно, ровно как в canary форка.
+      # Исходники tlottie/wallet-engine тоже оставляем (без target/): это вход
+      # стадии, и без них тёплый кэш библиотек нельзя пересобрать.
       - name: Free up some disk space.
         shell: bash
         run: |
-          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
+          find $LibrariesPath '(' \
+            '(' ! '(' \
+                -name '*.lib' -o -name '*.a' -o -name '*.exe' \
+                -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' \
+                -o -name '*.cmake' -o -name '*.pc' \
+                -o -path '*/include/*' \
+                -o -path '*/src/wallet_engine/*' \
+                -o '(' '(' -path '*/tlottie/*' -o -path '*/wallet-engine/*' ')' ! -path '*/target/*' ')' \
+                -o -path '*/objects-*' -o -path '*/cache_keys/*' \
+                -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' \
+            ')' -type f ')' \
+            -o '(' -empty ! -path '*/tlottie/*' ! -path '*/wallet-engine/*' ')' \
+          ')' -delete
+          ls -la "$LibrariesPath/tdesktop_rust/out/src/wallet_engine" 2>/dev/null || true
           df -h / 2>/dev/null || true
 
-      # Стадия tdesktop_rust в prepare.py заканчивается `move out\include\wallet_engine\
-      # wallet_engine.cpp out\src\wallet_engine\wallet_engine.cpp`, но bindgen не всегда
-      # отдаёт файл именно под этим именем, а prepare в silent-режиме ошибку глотает.
-      # Тогда Configure падает на «Cannot find source file: .../wallet_engine.cpp».
-      # Здесь мы это чиним: если файла нет, ищем сгенерированный .cpp рядом и кладём
-      # его на место; если не нашли — падаем сразу с листингом каталогов.
+      # Страховка на случай, если bindgen всё-таки не отдал .cpp: prepare в
+      # silent-режиме глотает ошибку стадии, и без этой проверки Configure
+      # умирает на «Cannot find source file» через час после старта сборки.
       - name: Ensure wallet engine.
         shell: bash
         run: |
@@ -392,12 +414,33 @@ jobs:
             echo "wallet_engine.cpp на месте ($(stat -c%s "$TARGET") байт)"
             exit 0
           fi
-          echo "wallet_engine.cpp отсутствует — ищу сгенерированный файл"
+          echo "wallet_engine.cpp отсутствует — пробую перегенерировать"
           mkdir -p "$W/out/src/wallet_engine"
-          FOUND=$(find "$W" -path '*wallet_engine*' -name '*.cpp' -type f 2>/dev/null | head -1 || true)
-          if [ -z "$FOUND" ]; then
-            FOUND=$(find "$W" -name '*.cpp' -type f -newer "$W/Cargo.toml" 2>/dev/null | head -1 || true)
+
+          # bindgen читает метаданные из собранной cdylib, поэтому DLL должен
+          # быть на месте. Исходники крейта сохраняет чистка выше.
+          DLL=$(find "$W/target" -name 'tdesktop_rust.dll' -type f 2>/dev/null | head -1 || true)
+          BINDGEN="$W/wallet-engine/bindgen/cpp/bindgen/Cargo.toml"
+          if [ -n "${DLL:-}" ] && [ -f "$BINDGEN" ]; then
+            echo "перегенерация: $DLL"
+            export RUSTUP_HOME="$TBUILD/ThirdParty/rust/rustup"
+            export CARGO_HOME="$TBUILD/ThirdParty/rust/cargo"
+            export PATH="$CARGO_HOME/bin:$PATH"
+            export RUSTUP_TOOLCHAIN=1.96.1
+            cargo run --manifest-path "$BINDGEN" --locked -- \
+              --library --out-dir "$W/out/include/wallet_engine" "$DLL" || true
+            if [ -f "$W/out/include/wallet_engine/wallet_engine.cpp" ]; then
+              mv "$W/out/include/wallet_engine/wallet_engine.cpp" "$TARGET"
+            fi
+          else
+            echo "перегенерация невозможна: dll='${DLL:-}' bindgen='$BINDGEN'"
           fi
+
+          if [ -f "$TARGET" ]; then
+            echo "wallet_engine.cpp восстановлен ($(stat -c%s "$TARGET") байт)"
+            exit 0
+          fi
+          FOUND=$(find "$W/out" -name 'wallet_engine*.cpp' -type f 2>/dev/null | head -1 || true)
           if [ -n "$FOUND" ]; then
             echo "беру $FOUND"
             cp "$FOUND" "$TARGET"
