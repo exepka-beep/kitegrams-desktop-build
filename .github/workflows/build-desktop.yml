@@ -376,6 +376,38 @@ jobs:
           find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
           df -h / 2>/dev/null || true
 
+      # Стадия tdesktop_rust в prepare.py заканчивается `move out\include\wallet_engine\
+      # wallet_engine.cpp out\src\wallet_engine\wallet_engine.cpp`, но bindgen не всегда
+      # отдаёт файл именно под этим именем, а prepare в silent-режиме ошибку глотает.
+      # Тогда Configure падает на «Cannot find source file: .../wallet_engine.cpp».
+      # Здесь мы это чиним: если файла нет, ищем сгенерированный .cpp рядом и кладём
+      # его на место; если не нашли — падаем сразу с листингом каталогов.
+      - name: Ensure wallet engine.
+        shell: bash
+        run: |
+          set -euo pipefail
+          W="$LibrariesPath/tdesktop_rust"
+          TARGET="$W/out/src/wallet_engine/wallet_engine.cpp"
+          if [ -f "$TARGET" ]; then
+            echo "wallet_engine.cpp на месте ($(stat -c%s "$TARGET") байт)"
+            exit 0
+          fi
+          echo "wallet_engine.cpp отсутствует — ищу сгенерированный файл"
+          mkdir -p "$W/out/src/wallet_engine"
+          FOUND=$(find "$W" -path '*wallet_engine*' -name '*.cpp' -type f 2>/dev/null | head -1 || true)
+          if [ -z "$FOUND" ]; then
+            FOUND=$(find "$W" -name '*.cpp' -type f -newer "$W/Cargo.toml" 2>/dev/null | head -1 || true)
+          fi
+          if [ -n "$FOUND" ]; then
+            echo "беру $FOUND"
+            cp "$FOUND" "$TARGET"
+            exit 0
+          fi
+          echo "FAIL: bindgen не оставил ни одного .cpp" >&2
+          ls -la "$W/out/include/wallet_engine" 2>/dev/null || true
+          ls -la "$W/out/src/wallet_engine" 2>/dev/null || true
+          exit 1
+
       - name: Configure.
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
