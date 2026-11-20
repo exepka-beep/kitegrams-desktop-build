@@ -42,6 +42,14 @@ name: Build KiteGrams desktop
 # Дополнительно в overlay подменён сам запасной адрес — на случай, если
 # автообновление когда-нибудь включат обратно.
 
+#
+# Почему две джобы (libraries + build)
+# ------------------------------------
+# actions/cache сохраняет кэш только у УСПЕШНОЙ джобы. Единая джоба
+# (Libraries ≈ 150 мин + Build ≈ 200 мин) упиралась в лимит времени,
+# гиблила и не сохраняла ни байта — каждый прогон начинался с нуля.
+# Теперь «libraries» (~160 мин) успевает завершиться и согреть кэш,
+# а «build» стартует с тёплым кэшем и укладывается в свой лимит.
 on:
   workflow_dispatch:
     inputs:
@@ -85,11 +93,380 @@ env:
 
 jobs:
 
-  windows:
-    name: Windows x64
+  libraries:
+    name: Windows x64 — Libraries (warm the cache)
     runs-on: windows-2022
-    # Стадия Libraries на холодном кэше ~40 минут, дальше Qt и сама сборка.
-    # Потолок GitHub — 6 часов, берём 5:50.
+    # Холодная стадия Libraries ~150 минут. Джоба существует, чтобы кэш
+    # вообще смог сохраниться: пост-шаг actions/cache пишет кэш только у
+    # успешной джобы.
+    timeout-minutes: 240
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Get repository name.
+        shell: bash
+        run: |
+          # Имя каталога для клона базы. Короткое имя — не косметика: внутри
+          # подмодуля `range-v3/doc/gh-pages` лежат сгенерированные doxygen-файлы
+          # с именами под 130 символов, и при длинном пути git падает на
+          # checkout с `Filename too long`. `src` экономит 23 символа (имя
+          # репозитория встречается в пути трижды).
+          echo "REPO_NAME=src" >> $GITHUB_ENV
+
+      - name: Enable long paths.
+        # Вторая страховка к короткому имени: `core.longpaths` заставляет
+        # Git for Windows работать через `\\?\`-пути. Должно стоять до клонов.
+        shell: bash
+        run: git config --global core.longpaths true
+
+      - name: Checkout this repository (overlay and scripts).
+        uses: actions/checkout@v7
+
+      - name: Clone the base.
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: Apply the KiteGrams overlay.
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="$GITHUB_WORKSPACE/TBuild/$REPO_NAME"
+          test -d "$DEST/Telegram" || { echo "нет дерева исходников в $DEST" >&2; exit 1; }
+          test -d files || { echo "нет каталога files/ с overlay" >&2; exit 1; }
+
+          copied=0
+          while IFS= read -r -d '' src; do
+            rel="${src#files/}"
+            mkdir -p "$DEST/$(dirname "$rel")"
+            cp "$src" "$DEST/$rel"
+            copied=$((copied + 1))
+          done < <(find files -type f -print0)
+
+          echo "скопировано файлов overlay: $copied"
+          if [ "$copied" -lt 10 ]; then
+            echo "подозрительно мало файлов в overlay — ожидалось 13" >&2
+            exit 1
+          fi
+
+      - name: Fetch the server RSA key.
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ключ создаётся при первом старте сервера и в репозитории лежать не
+          # может: собрать клиент с чужим ключом хуже, чем не собрать вовсе.
+          python scripts/bake_server_key.py \
+            --url "$SERVER_INFO_URL" --out server-rsa-public.pem
+
+      - name: Bake the key into the client.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/set_server_key.py \
+            --source "$GITHUB_WORKSPACE/TBuild/$REPO_NAME/Telegram/SourceFiles/mtproto/mtproto_dc_options.cpp" \
+            --pem server-rsa-public.pem
+
+      - name: Verify branding, address and key.
+        shell: bash
+        run: |
+          set -uo pipefail
+          SRC="$GITHUB_WORKSPACE/TBuild/$REPO_NAME"
+          VERSION="$SRC/Telegram/SourceFiles/core/version.h"
+          DCOPT="$SRC/Telegram/SourceFiles/mtproto/mtproto_dc_options.cpp"
+          CML="$SRC/Telegram/CMakeLists.txt"
+          AUMID="$SRC/Telegram/SourceFiles/platform/win/windows_app_user_model_id.cpp"
+          fail=0
+
+          want() {  # want <описание> <файл> <regex> <есть|нет>
+            local what="$1" file="$2" pattern="$3" expect="$4" got="нет"
+            grep -qE "$pattern" "$file" && got="есть"
+            if [ "$got" = "$expect" ]; then
+              echo "  ok    $what"
+            else
+              echo "  FAIL  $what — ожидалось '$expect', получено '$got'" >&2
+              fail=1
+            fi
+          }
+
+          want "имя приложения"          "$VERSION" 'AppName = "KiteGrams Desktop"'      "есть"
+          want "имя exe"                 "$CML"     'set\(output_name "KiteGrams"\)'      "есть"
+          want "AUMID"                   "$AUMID"   'KiteGrams\.KiteGramsDesktop'         "есть"
+          want "наш адрес DC"            "$DCOPT"   "\"$APP_SERVER_HOST\", $APP_SERVER_PORT" "есть"
+          want "нет адресов Telegram"    "$DCOPT"   '149\.154\.1[0-9][0-9]\.'             "нет"
+          want "нет автообновления с td.telegram.org" \
+                                         "$SRC/Telegram/SourceFiles/storage/localstorage.cpp" \
+                                                   'td\.telegram\.org'                 "нет"
+
+          # Ключ должен совпасть с тем, что отдал сервер: иначе рукопожатие
+          # провалится и клиент повиснет на «Connecting…».
+          if python scripts/set_server_key.py --source "$DCOPT" \
+               --pem server-rsa-public.pem --check; then
+            echo "  ok    RSA-ключ совпадает с сервером"
+          else
+            echo "  FAIL  RSA-ключ не совпадает с сервером" >&2
+            fail=1
+          fi
+
+          # prepare.py в этой базе уже с upstream-фиксом стадии ffmpeg. Проверяем
+          # это явно: если фикс откатят, сборка умрёт через 40 минут на
+          # `[25/32](Libraries/ffmpeg): FAILED`, и лучше узнать об этом сразу.
+          PREP="$SRC/$PREPARE_PATH"
+          if grep -q 'bash --login ../patches/build_ffmpeg_win.sh' "$PREP" \
+             && ! grep -q 'VCToolsInstallDir' "$PREP"; then
+            echo "  ok    стадия ffmpeg в prepare.py как в upstream"
+          else
+            echo "  FAIL  prepare.py откатился к сломанной стадии ffmpeg" >&2
+            fail=1
+          fi
+
+          [ "$fail" = 0 ] || exit 1
+          echo "брендинг, адрес и ключ на месте."
+
+      # Qt 6.11 падает на `mocs_compilation_RelWithDebInfo.cpp` с
+      # `fatal error C1083: Cannot open compiler generated file: ''`: стадия
+      # собирает Qt с `-force-debug-info`, а на этой связке (Qt 6.11.2 +
+      # MSVC 14.44 + Ninja) PDB для `qtmultimedia` не заводится. Пробовали
+      # явный ProgramDatabase — `/Fd` стал корректным, ошибка осталась:
+      # путь относительный (`qtbase\lib\...`), каталога ещё нет.
+      # Поэтому просто убираем `-force-debug-info`: Qt собирается обычным
+      # Release без /Zi и /Fd, символы Qt нам не нужны (crash reports off).
+      # Патч меняет prepare.py до Libraries, поэтому хэш кэша (шаг ниже)
+      # считается уже по исправленному файлу.
+      - name: Patch prepare.py (no Qt debug info).
+        shell: bash
+        run: |
+          SRC="$GITHUB_WORKSPACE/TBuild/$REPO_NAME"
+          PREP="$SRC/$PREPARE_PATH"
+          python scripts/patch_prepare_qt_pdb.py "$PREP"
+          if grep -q 'force-debug-info' "$PREP"; then
+            echo "FAIL: -force-debug-info остался в prepare.py" >&2
+            exit 1
+          fi
+          echo "Qt собирается без debug info."
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          # Ключ кэша библиотек: меняется при правке prepare.py или SDK.
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: 14.44
+
+      - name: Check ATL availability.
+        # `windows-latest` уже переезжал на VS 2026, где ATL не установлен, и
+        # сборка гибла на 27-й стадии из 32 через 40 минут после старта:
+        #   error C1083: Cannot open include file: 'atlbase.h'
+        # Проверка стоит секунды и делает отказ мгновенным.
+        #
+        # Где лежит ATL — спрашиваем не у догадки, а у `vcvarsall`: он кладёт
+        # каталог в `INCLUDE`, то есть ровно туда, откуда его возьмёт `cl.exe`.
+        shell: bash
+        run: |
+          set -uo pipefail
+          ATL_DIR="$(printf '%s' "${INCLUDE:-}" | tr ';' '\n' \
+            | grep -i 'atlmfc' | head -1 | tr -d '\r')"
+          if [ -z "$ATL_DIR" ]; then
+            echo "В INCLUDE нет ATLMFC — ищу по дереву Visual Studio..." >&2
+            ATL_HDR="$(find "/c/Program Files/Microsoft Visual Studio" -maxdepth 8 \
+              -iname atlbase.h 2>/dev/null | head -1 || true)"
+            if [ -z "$ATL_HDR" ]; then
+              echo "FAIL: ATL не установлен — breakpad (Release) не соберётся." >&2
+              echo "INCLUDE=${INCLUDE:-<пусто>}" >&2
+              exit 1
+            fi
+            echo "ATL найден по дереву: $ATL_HDR"
+            exit 0
+          fi
+          ATL_UNIX="$(cygpath -u "$ATL_DIR" 2>/dev/null || printf '%s' "$ATL_DIR")"
+          for hdr in atlbase.h atlcomcli.h; do
+            if [ ! -f "$ATL_UNIX/$hdr" ]; then
+              echo "FAIL: нет $hdr в $ATL_DIR — breakpad (Release) не соберётся." >&2
+              exit 1
+            fi
+          done
+          echo "ATL найден: $ATL_DIR"
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: ThirdParty cache.
+        id: cache-third-party
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.OS }}-${{ runner.arch }}-third-party-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-${{ runner.arch }}-third-party-
+
+      - name: Libraries cache.
+        id: cache-libs
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-libs-v2-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-libs-v2-
+
+      - name: Qt cache.
+        id: cache-qt
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-qt-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-qt-
+
+      - name: Choose prepare options.
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `skip-release` пропускает в prepare.py ВСЕ команды со scope `release:`
+          # — в частности `ninja -C out/Release_x64` в breakpad. Родной canary
+          # форка собирает библиотеки без skip-release, и нам Release нужен:
+          # Debug требует отладочный CRT (MSVCP140D.dll и К°), который нельзя
+          # распространять.
+          #
+          # Цена: библиотеки собираются в двух конфигурациях — времени и диска
+          # примерно вдвое больше.
+          if [ "${{ inputs.build_type }}" = "Debug" ]; then
+            echo "PREPARE_OPTS=skip-release" >> $GITHUB_ENV
+            echo "библиотеки: только Debug (skip-release)"
+          else
+            echo "PREPARE_OPTS=" >> $GITHUB_ENV
+            echo "библиотеки: Debug + Release — как в canary.yml"
+          fi
+
+      - name: Disk before libraries.
+        shell: bash
+        run: df -h / || true
+
+      - name: Libraries.
+        # Самая долгая часть: 32 сторонние библиотеки + Qt из исходников.
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat %PREPARE_OPTS% silent
+
+      - name: Disk after libraries.
+        shell: bash
+        run: df -h / || true
+
+      # ВАЖНО: `-path '*/src/wallet_engine/*'` здесь не для красоты.
+      #
+      # Стадия tdesktop_rust кладёт сгенерированный UniFFI-файл в
+      # `tdesktop_rust/out/src/wallet_engine/wallet_engine.cpp`, и
+      # `cmake/external/wallet_engine` компилирует его как обычный исходник.
+      # Это .cpp, он не попадает ни под один шаблон ниже — и прошлая версия
+      # этой чистки удаляла его через полсекунды после создания. Дальше
+      # Configure падал на «Cannot find source file», а выглядело так, будто
+      # виноват bindgen: в `out/include/wallet_engine` оставались только .hpp.
+      # Поэтому каталог исключается явно, ровно как в canary форка.
+      # Исходники tlottie/wallet-engine тоже оставляем (без target/): это вход
+      # стадии, и без них тёплый кэш библиотек нельзя пересобрать.
+      - name: Free up some disk space.
+        shell: bash
+        run: |
+          find $LibrariesPath '(' \
+            '(' ! '(' \
+                -name '*.lib' -o -name '*.a' -o -name '*.exe' \
+                -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' \
+                -o -name '*.cmake' -o -name '*.pc' \
+                -o -path '*/include/*' \
+                -o -path '*/src/wallet_engine/*' \
+                -o '(' '(' -path '*/tlottie/*' -o -path '*/wallet-engine/*' ')' ! -path '*/target/*' ')' \
+                -o -path '*/objects-*' -o -path '*/cache_keys/*' \
+                -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' \
+            ')' -type f ')' \
+            -o '(' -empty ! -path '*/tlottie/*' ! -path '*/wallet-engine/*' ')' \
+          ')' -delete
+          ls -la "$LibrariesPath/tdesktop_rust/out/src/wallet_engine" 2>/dev/null || true
+          df -h / 2>/dev/null || true
+
+      # Страховка на случай, если bindgen всё-таки не отдал .cpp: prepare в
+      # silent-режиме глотает ошибку стадии, и без этой проверки Configure
+      # умирает на «Cannot find source file» через час после старта сборки.
+      - name: Ensure wallet engine.
+        shell: bash
+        run: |
+          set -euo pipefail
+          W="$LibrariesPath/tdesktop_rust"
+          TARGET="$W/out/src/wallet_engine/wallet_engine.cpp"
+          if [ -f "$TARGET" ]; then
+            echo "wallet_engine.cpp на месте ($(stat -c%s "$TARGET") байт)"
+            exit 0
+          fi
+          echo "wallet_engine.cpp отсутствует — пробую перегенерировать"
+          mkdir -p "$W/out/src/wallet_engine"
+
+          # bindgen читает метаданные из собранной cdylib, поэтому DLL должен
+          # быть на месте. Исходники крейта сохраняет чистка выше.
+          DLL=$(find "$W/target" -name 'tdesktop_rust.dll' -type f 2>/dev/null | head -1 || true)
+          BINDGEN="$W/wallet-engine/bindgen/cpp/bindgen/Cargo.toml"
+          if [ -n "${DLL:-}" ] && [ -f "$BINDGEN" ]; then
+            echo "перегенерация: $DLL"
+            export RUSTUP_HOME="$TBUILD/ThirdParty/rust/rustup"
+            export CARGO_HOME="$TBUILD/ThirdParty/rust/cargo"
+            export PATH="$CARGO_HOME/bin:$PATH"
+            export RUSTUP_TOOLCHAIN=1.96.1
+            cargo run --manifest-path "$BINDGEN" --locked -- \
+              --library --out-dir "$W/out/include/wallet_engine" "$DLL" || true
+            if [ -f "$W/out/include/wallet_engine/wallet_engine.cpp" ]; then
+              mv "$W/out/include/wallet_engine/wallet_engine.cpp" "$TARGET"
+            fi
+          else
+            echo "перегенерация невозможна: dll='${DLL:-}' bindgen='$BINDGEN'"
+          fi
+
+          if [ -f "$TARGET" ]; then
+            echo "wallet_engine.cpp восстановлен ($(stat -c%s "$TARGET") байт)"
+            exit 0
+          fi
+          FOUND=$(find "$W/out" -name 'wallet_engine*.cpp' -type f 2>/dev/null | head -1 || true)
+          if [ -n "$FOUND" ]; then
+            echo "беру $FOUND"
+            cp "$FOUND" "$TARGET"
+            exit 0
+          fi
+          echo "FAIL: bindgen не оставил ни одного .cpp" >&2
+          ls -la "$W/out/include/wallet_engine" 2>/dev/null || true
+          ls -la "$W/out/src/wallet_engine" 2>/dev/null || true
+          exit 1
+
+
+  build:
+    name: Windows x64 — Build and package
+    needs: libraries
+    runs-on: windows-2022
+    # Тёплый кэш: prepare проверяет cache_keys и пересобирает только
+    # отсутствующее, дальше Configure и сборка (~200 минут).
     timeout-minutes: 350
 
     defaults:
