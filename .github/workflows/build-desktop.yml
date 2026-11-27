@@ -59,10 +59,10 @@ on:
         options: ["Release", "Debug"]
         default: "Release"
       parallel:
-        description: "Сколько файлов компилировать одновременно. 2 — безопасно (Release упирается в память компилятора), 4 — быстро, но на qrc_emoji_*.cpp ловится C1060 out of heap space"
+        description: "Сколько файлов компилировать одновременно. 1 — самый безопасный режим (при 2 Release всё равно ловит C1060 out of heap space), 4 — быстро, но ловится C1060 на qrc_emoji_*.cpp"
         type: choice
-        options: ["2", "3", "4"]
-        default: "2"
+        options: ["1", "2", "3", "4"]
+        default: "1"
 
 env:
   # База. Коммит закреплён: overlay снят ровно с этого дерева, а ветка `dev`
@@ -840,10 +840,9 @@ jobs:
             -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 
       - name: Build.
-        # Параллелизм — входной параметр, по умолчанию 2: три гигантских
-        # сгенерированных qrc_emoji_*.cpp (~85k строк строковых литералов)
-        # компилируются одновременно, по одному cl.exe на файл, и раннер на
-        # 16 ГБ ловит `error C1060: compiler is out of heap space`.
+        # Параллелизм — входной параметр. По умолчанию 1: даже два одновременно
+        # компилируемых файла (qrc_emoji_*.cpp или обычные SourceFiles) упираются
+        # в `error C1060: compiler is out of heap space` на 16 ГБ раннере.
         run: cmake --build %TBUILD%\%REPO_NAME%\out --config ${{ inputs.build_type }} --parallel ${{ inputs.parallel }}
 
       - name: Locate the exe.
